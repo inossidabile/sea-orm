@@ -17,6 +17,7 @@ pub mod indexes;
 pub mod ingredient;
 pub mod lunch_set;
 pub mod lunch_set_expanded;
+pub mod orders;
 pub mod rust_keyword;
 pub mod sea_orm_active_enums;
 #[cfg(feature = "with-json")]
