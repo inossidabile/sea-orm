@@ -64,6 +64,28 @@ impl SchemaBuilder {
         self
     }
 
+    /// Register an entity together with extra indexes schema-sync cannot derive from
+    /// column-level attributes alone (a partial predicate, an explicit column order, or
+    /// a non-unique composite index). Each statement in `extra` must carry an explicit
+    /// `.name(...)`: sync recognizes one of these across runs by name, not just by the
+    /// columns it covers, so it is never mistaken for a stale index and dropped.
+    pub fn register_with_indexes<E: EntityTrait>(
+        mut self,
+        entity: E,
+        extra: Vec<IndexCreateStatement>,
+    ) -> Self {
+        let mut info = EntitySchemaInfo::new(entity, &self.helper);
+        info.indexes.extend(extra);
+        if !self
+            .entities
+            .iter()
+            .any(|e| e.table.get_table_name() == info.table.get_table_name())
+        {
+            self.entities.push(info);
+        }
+        self
+    }
+
     #[cfg(feature = "entity-registry")]
     pub(crate) fn helper(&self) -> &Schema {
         &self.helper
@@ -492,13 +514,14 @@ impl EntitySchemaInfo {
         } else {
             db.execute(&self.table).await?;
         }
+        if existing_table.is_some() && db_backend == DbBackend::Postgres {
+            self.replace_drifted_postgres_indexes(db).await?;
+        }
         for stmt in self.indexes.iter() {
             let mut has_index = false;
             if let Some(existing_table) = existing_table {
                 for existing_index in existing_table.get_indexes() {
-                    if existing_index.get_index_spec().get_column_names()
-                        == stmt.get_index_spec().get_column_names()
-                    {
+                    if index_matches(existing_index, stmt) {
                         has_index = true;
                         break;
                     }
@@ -558,9 +581,7 @@ impl EntitySchemaInfo {
                 if existing_index.is_unique_key() {
                     let mut has_index = false;
                     for stmt in self.indexes.iter() {
-                        if existing_index.get_index_spec().get_column_names()
-                            == stmt.get_index_spec().get_column_names()
-                        {
+                        if index_matches(existing_index, stmt) {
                             has_index = true;
                             break;
                         }
@@ -589,18 +610,7 @@ impl EntitySchemaInfo {
                             .map(|s| s.to_owned())
                     {
                         if db_backend == DbBackend::Postgres {
-                            // On PostgreSQL, unique indexes created via column-level UNIQUE
-                            // (e.g. ADD COLUMN ... UNIQUE) are backed by a named constraint.
-                            // DROP INDEX fails on constraint-owned indexes; use
-                            // ALTER TABLE ... DROP CONSTRAINT instead.
-                            db.execute(
-                                TableAlterStatement::new()
-                                    .table(
-                                        self.table.get_table_name().expect("Checked above").clone(),
-                                    )
-                                    .drop_constraint(drop_existing),
-                            )
-                            .await?;
+                            self.drop_postgres_index(db, drop_existing).await?;
                         } else {
                             // MySQL requires `DROP INDEX <name> ON <table>`; without the
                             // target table the statement is a syntax error.
@@ -617,6 +627,103 @@ impl EntitySchemaInfo {
                         }
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// The definition Postgres reports for index `name` on this entity's table, if any.
+    async fn postgres_index_definition<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        name: &str,
+    ) -> Result<Option<String>, DbErr> {
+        let TableName(_, table_iden) = get_table_name(self.table.get_table_name());
+        let row = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT pg_get_indexdef(i.indexrelid) AS def FROM pg_index i \
+                 JOIN pg_class ic ON ic.oid = i.indexrelid \
+                 JOIN pg_class tc ON tc.oid = i.indrelid \
+                 JOIN pg_namespace n ON n.oid = tc.relnamespace \
+                 WHERE ic.relname = $1 AND tc.relname = $2 \
+                 AND n.nspname = COALESCE($3, current_schema())",
+                [
+                    name.into(),
+                    table_iden.to_string().into(),
+                    self.schema_name.clone().into(),
+                ],
+            ))
+            .await?;
+        row.map(|row| row.try_get::<String>("", "def")).transpose()
+    }
+
+    /// Drops index `name` from this entity's table. Unique indexes created through a
+    /// constraint (e.g. column-level UNIQUE) can only be dropped as that constraint, while
+    /// a plain or partial `CREATE [UNIQUE] INDEX` has no constraint to drop. The statement
+    /// is chosen up front because a failed attempt would abort an enclosing transaction.
+    async fn drop_postgres_index<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        name: String,
+    ) -> Result<(), DbErr> {
+        let TableName(_, table_iden) = get_table_name(self.table.get_table_name());
+        let backed_by_constraint = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT 1 FROM pg_constraint c \
+                 JOIN pg_class tc ON tc.oid = c.conrelid \
+                 JOIN pg_namespace n ON n.oid = tc.relnamespace \
+                 WHERE c.conname = $1 AND tc.relname = $2 \
+                 AND n.nspname = COALESCE($3, current_schema())",
+                [
+                    name.clone().into(),
+                    table_iden.to_string().into(),
+                    self.schema_name.clone().into(),
+                ],
+            ))
+            .await?
+            .is_some();
+        let table = self.table.get_table_name().expect("table must have a name").clone();
+        if backed_by_constraint {
+            db.execute(TableAlterStatement::new().table(table).drop_constraint(name))
+                .await?;
+        } else {
+            let table_ref = index_table_ref(table, DbBackend::Postgres);
+            db.execute(sea_query::Index::drop().name(name).table(table_ref))
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Replaces declared indexes that exist under their name but with a different
+    /// definition (columns, order, uniqueness or predicate). Postgres normalizes index
+    /// definitions, so the declared index is built under a probe name and the two
+    /// `pg_get_indexdef` outputs are compared; matching indexes are left untouched.
+    async fn replace_drifted_postgres_indexes<C: ConnectionTrait>(
+        &self,
+        db: &C,
+    ) -> Result<(), DbErr> {
+        for stmt in self.indexes.iter() {
+            let Some(name) = stmt.get_index_spec().get_name().map(|s| s.to_owned()) else {
+                continue;
+            };
+            let Some(existing_def) = self.postgres_index_definition(db, &name).await? else {
+                continue;
+            };
+            // Postgres truncates identifiers at 63 bytes.
+            let probe = format!("{}__sync_probe", name.chars().take(48).collect::<String>());
+            let mut probe_stmt = stmt.clone();
+            probe_stmt.name(probe.as_str());
+            db.execute(&probe_stmt).await?;
+            let probe_def = self.postgres_index_definition(db, &probe).await?;
+            self.drop_postgres_index(db, probe.clone()).await?;
+            let declared_def = probe_def
+                .ok_or_else(|| DbErr::Custom(format!("probe index {probe} was not created")))?
+                .replacen(&probe, &name, 1);
+            if declared_def != existing_def {
+                self.drop_postgres_index(db, name).await?;
+                db.execute(stmt).await?;
             }
         }
         Ok(())
@@ -673,6 +780,22 @@ fn render_column_type(backend: DbBackend, col_type: &sea_query::ColumnType) -> S
         DbBackend::Sqlite => sea_query::SqliteQueryBuilder.prepare_column_type(col_type, &mut sql),
     }
     sql
+}
+
+/// Whether an existing index is the declared one. Names identify an index when both
+/// sides carry one: a stale unique index on the same columns as a declared partial index
+/// is a different index and must not be mistaken for it.
+fn index_matches(existing: &IndexCreateStatement, declared: &IndexCreateStatement) -> bool {
+    match (
+        existing.get_index_spec().get_name(),
+        declared.get_index_spec().get_name(),
+    ) {
+        (Some(existing_name), Some(declared_name)) => existing_name == declared_name,
+        _ => {
+            existing.get_index_spec().get_column_names()
+                == declared.get_index_spec().get_column_names()
+        }
+    }
 }
 
 fn compare_foreign_key(a: &ForeignKeyCreateStatement, b: &ForeignKeyCreateStatement) -> bool {
